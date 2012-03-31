@@ -1,0 +1,4 @@
+ticcFS
+======
+
+Implementation of ticcFS - my experimental filesystem that I develop for educational purposes. Not particularly useful for anyone who does not want to read the source code to develop their own filesystem or understand the kernel VFS internals.
