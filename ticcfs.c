@@ -10,11 +10,9 @@
 MODULE_LICENSE("GPL");
 
 #define TICCFS_MAGIC 0x99999
-#define TICCFS_NAME_LEN 255
-
-#define TICCFS_COUNT 32  //počet položek v souborovém systému
-#define TICCFS_NAMELEN 64 //maximální délka názvu položky
-#define TICCFS_DATALEN 32 //maximální možství zachycených dat v souboru
+#define TICCFS_COUNT 32  // max number of files
+#define TICCFS_NAMELEN 64 // max filename size
+#define TICCFS_DATALEN 32 // max filesize
 
 typedef struct {
         struct inode*   i;
@@ -23,16 +21,10 @@ typedef struct {
         int             datalen;
 } t_tfs_direntry;
 
+// this is where the information about objects (files/dirs in our
+// filesystem is going to be stored
 static t_tfs_direntry tfs_direntry[TICCFS_COUNT];
 static int tfs_cnt = 0;
-
-char nic[10] = "nic";
-
-static inline t_tfs_direntry *TICCFS_I(struct inode *inode)
-{        
-	//return container_of(inode, t_tfs_direntry, i);
-        return NULL;
-}
 
 const struct inode_operations ticcfs_dir_inode_operations;
 
@@ -40,51 +32,11 @@ struct ticcfs_inode_info {
         struct inode vfs_inode;
 };
 
-void ticcfs_put_super(struct super_block* sb) {
-        return;
-}
-
-
-int ticcfs_statfs(struct dentry* dentry, struct kstatfs* buf) {
-	struct super_block *sb = dentry->d_sb;
-        buf->f_type = TICCFS_MAGIC;
-        buf->f_bsize = sb->s_blocksize;
-        buf->f_blocks = 9;
-        buf->f_bfree = 9;
-        buf->f_bavail = 9;
-        buf->f_files = 0;
-        buf->f_ffree = 0;
-        buf->f_namelen = TICCFS_NAME_LEN;
-        printk(KERN_DEBUG "ticcfs: statfs\n");
-        return 0;
-}
-
-void ticcfs_umount_begin(struct super_block* sb) {
-	kfree(sb->s_subtype);
-	kfree(sb->s_options);
-	kfree(sb);
-
-}
-
 static struct super_operations ticcfs_sops = {
         .statfs = simple_statfs,
 	.drop_inode	= generic_delete_inode,
 	.show_options	= generic_show_options,
 };
-
-ssize_t ticcfs_read_dir(struct file *filp, char __user *buf, size_t siz, loff_t *ppos)
-{
-      
-        printk("ticcfs: fuck read %d\n", (int)*ppos);
-        if(*ppos == 0) {
-                copy_to_user(buf, "test", 4);
-                *ppos = 4;
-                return 4;
-        }
-        else
-        return 0;
-
-}
 
 const struct file_operations ticcfs_dir_operations = {
 	.open		= dcache_dir_open,
@@ -94,14 +46,6 @@ const struct file_operations ticcfs_dir_operations = {
 	.readdir	= dcache_readdir,
 	.fsync		= simple_sync_file,
 };
-
-int ticc_readlink(struct dentry *dentry, char __user *buffer, int buflen)
-{
-        printk("ticcfs: READLILNK\n");
-        buffer[0] = 'Y';
-        buffer[1] = 0;
-        return 0;
-}
 
 t_tfs_direntry *get_tfs_direntry(struct inode *inode) 
 {
@@ -145,13 +89,11 @@ int ticcfs_getattr(struct vfsmount *mnt, struct dentry *dentry,
         return simple_getattr(mnt, dentry, stat);
 }
 
-
 const struct inode_operations ticcfs_file_inode_operations = {
 	.getattr	= ticcfs_getattr,
 	.readlink	= generic_readlink,
         .follow_link    = ticcfs_follow_link,
 };
-
 
 loff_t ticcfs_llseek(struct file * f, loff_t o, int x)
 {
@@ -251,7 +193,7 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
         case S_IFDIR:             
                 printk("ticcfs: dir\n");
                 inode->i_fop = &ticcfs_dir_operations;
-                inode->i_op = &ticcfs_dir_inode_operations;
+                inode->i_op = &ticcfs_dir_inode_operations; // be careful to assign this property only to directory entries (otherwise the VFS will consider this inode to be a directory)
 
                 inc_nlink(inode);
                 break;
@@ -259,12 +201,9 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
                 inode->i_op = &ticcfs_file_inode_operations;
                 break;
         }
-        //inc_nlink(inode);
 
         return inode;
 }
-
-
 
 static int ticcfs_mknod(struct inode *dir, struct dentry *dentry, int mode, dev_t dev)
 {
@@ -338,8 +277,6 @@ const struct inode_operations ticcfs_dir_inode_operations = {
         .create         = ticcfs_create,
 };
 
-
-
 int ticcfs_fill_super(struct super_block* sb, void* data, int silent) 
 {
         struct dentry* root;
@@ -369,8 +306,6 @@ void ticcfs_kill_sb(struct super_block* sb)
 {
         kill_litter_super(sb);
 }
-
-
 
 static struct file_system_type fs_type = 
 { 
