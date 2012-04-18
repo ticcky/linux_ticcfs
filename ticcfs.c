@@ -11,7 +11,7 @@ TODO:
 
 predelat statfs
 */
-#include "inc/ticcfs.h"
+#include "ticcfs.h"
 #include <linux/module.h>
 //#include <linux/config.h>
 #include <linux/init.h>
@@ -21,51 +21,86 @@ predelat statfs
 #include <linux/namei.h>
 #include <linux/pagemap.h>
 
-
 MODULE_LICENSE("GPL");
-
-#define TICCFS_MAGIC 0x99999
-#define TICCFS_COUNT 32  // max number of files
-#define TICCFS_NAMELEN 64 // max filename size
-#define TICCFS_DATALEN 32 // max filesize
-#define TICCFS_DEFAULT_ID 'A'
-#define TICCFS_BDIR 5
-#define TICCFS_BINDIR 5
-
-#define DEBUG(args...) {printk("ticcfs [%s] ------ \n", __FUNCTION__);}
-#define DEBUGM(format, args...) {printk("ticcfs [%s]: ", __FUNCTION__); printk(format "\n", args);}
-#define DEBUGS(s) {printk("ticcfs [%s]: %s\n", __FUNCTION__, s);}
+MODULE_AUTHOR("Lukas Zilka <lukas@zilka.me>");
 
 static struct kmem_cache * ticcfs_inode_cachep;
 
-struct ticcfs_inode {
-        void *data;
-        struct inode vfs_inode;
-};
-
-struct ticcfs_mount_opts {
-    char id;
-};
-
-struct ticcfs_fs_info {
-    struct ticcfs_mount_opts mount_opts;
-};
-
-struct ticcfs_direntry {
-        struct inode*   i;
-        unsigned int    type;
-        char            name[TICCFS_NAMELEN];
-};
-
-struct ticcfs_dir {
-        int cnt;
-        struct ticcfs_direntry entries[];
-};
-
-
-static inline struct ticcfs_inode *TICCFS_I(struct inode *inode)
+int ticcfs_get_page_number_of(loff_t size)
 {
-	return container_of(inode, struct ticcfs_inode, vfs_inode);
+        return size / PAGE_SIZE + ((size % PAGE_SIZE) > 0);
+}
+
+void ticcfs_get_direct_indirect(loff_t size, int *nr_indirect, int *nr_total_indirect, int *nr_direct)
+{
+        int nr_pages = ticcfs_get_page_number_of(size);
+        *nr_direct = nr_pages;
+
+        if(*nr_direct > TICCFS_NDIR) {
+                DEBUGS("have to use indirect");
+                *nr_direct = TICCFS_NDIR;
+                *nr_total_indirect = (nr_pages - TICCFS_NDIR);
+                *nr_indirect = *nr_total_indirect / TICCFS_NDIR_PER_PAGE + 
+                        (*nr_total_indirect % TICCFS_NDIR_PER_PAGE > 0);
+        } else {
+                *nr_total_indirect = 0;
+                *nr_indirect = 0;
+        }
+        
+}
+
+long unsigned min_l(long unsigned a, long unsigned b) {
+        if(a > b)
+                return b;
+        else
+                return a;
+}
+
+static void ticcfs_realloc_data(struct inode * inode, loff_t size)
+{       
+        int i, y;
+        int nr_pages = ticcfs_get_page_number_of(size);
+        int nr_direct = nr_pages;
+        int nr_indirect = 0;
+        int nr_total_indirect = 0;
+
+        DEBUGM("size: %lld, page_size: %ld", (long long) size, PAGE_SIZE);
+
+        ticcfs_get_direct_indirect(size, &nr_indirect, &nr_total_indirect, &nr_direct);
+
+        DEBUGM("reallocing to %d direct and %d indirect (%d total indirect)", nr_direct, nr_indirect, nr_total_indirect);
+        
+        for(i = 0; i < nr_direct; i++) {
+                DEBUGS("reallocing direct");
+                if(TICCFS_I(inode)->data_direct[i] == NULL) {
+                        TICCFS_I(inode)->data_direct[i] = (void *) get_zeroed_page(GFP_KERNEL);
+                        DEBUGM("realloced %p", TICCFS_I(inode)->data_direct[i]);
+                } else {
+                        DEBUGM("not realloced %p", TICCFS_I(inode)->data_direct[i]);
+                }
+        }
+
+        for(i = 0; i < nr_indirect; i++) {
+                DEBUGS("reallocing indirect");
+                if(TICCFS_I(inode)->data_indirect[i] == NULL) {
+                        TICCFS_I(inode)->data_indirect[i] = (char **) get_zeroed_page(GFP_KERNEL);                        
+                        DEBUGM("realloced %p", TICCFS_I(inode)->data_indirect[i]);
+                } else {
+                        DEBUGM("not realloced %p", TICCFS_I(inode)->data_indirect[i]);
+                }
+                DEBUGM(" ===== min %lu %lu = %lu", nr_total_indirect, TICCFS_NDIR_PER_PAGE, min_l(nr_total_indirect, TICCFS_NDIR_PER_PAGE));
+                for(y = 0; y < min_l(nr_total_indirect, TICCFS_NDIR_PER_PAGE); y++) {                                
+                        if(TICCFS_I(inode)->data_indirect[i][y] == NULL) {
+                                TICCFS_I(inode)->data_indirect[i][y] = (void *) get_zeroed_page(GFP_KERNEL);                                                                
+                                DEBUGM("realloced indirect2 %p", TICCFS_I(inode)->data_indirect[i][y]);
+                        } else {
+                                DEBUGM("not realloced indirect2 %p", TICCFS_I(inode)->data_indirect[i][y]);
+                        }
+                }
+                nr_total_indirect -= y;
+        }
+
+
 }
 
 static int ticcfs_parse_options(char *data, struct ticcfs_mount_opts *opts) 
@@ -93,14 +128,12 @@ static struct inode *ticcfs_alloc_inode(struct super_block *sb)
         if(!ti)
                 return NULL;
 
-        ti->data = (void *) get_zeroed_page(GFP_KERNEL); // alloc_page(GFP_KERNEL);
-        DEBUGM("allocated at %p and page %p", ti, ti->data);
         return &ti->vfs_inode;
 }
 
+
 static int ticcfs_readdir(struct file * filp, void *dirent, filldir_t filldir) 
 {
-
 	struct dentry *dentry = filp->f_path.dentry;
         ino_t ino;
 	int i = filp->f_pos;
@@ -110,7 +143,7 @@ static int ticcfs_readdir(struct file * filp, void *dirent, filldir_t filldir)
         DEBUG();
 
         inode = dentry->d_inode;
-        d = TICCFS_I(inode)->data;
+        d = (struct ticcfs_dir *) TICCFS_I(inode)->data_direct[0];
         
 	switch (i) {
 		case 0:
@@ -148,27 +181,9 @@ static int ticcfs_readdir(struct file * filp, void *dirent, filldir_t filldir)
         return 0;
 }
 
-const struct inode_operations ticcfs_dir_inode_operations;
-
-static struct super_operations ticcfs_sops = {
-        .statfs = simple_statfs,
-	.drop_inode	= generic_delete_inode,
-	.show_options	= generic_show_options,
-        .alloc_inode    = ticcfs_alloc_inode,
-};
-
-const struct file_operations ticcfs_dir_operations = {
-	.open		= dcache_dir_open,
-	.release	= dcache_dir_close,
-	.llseek		= dcache_dir_lseek,
-	.read		= generic_read_dir,
-	.readdir	= ticcfs_readdir,
-	.fsync		= simple_sync_file,
-};
-
 static void *ticcfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 {
-        nd_set_link(nd, TICCFS_I(dentry->d_inode)->data);
+        nd_set_link(nd, TICCFS_I(dentry->d_inode)->data_direct[0]);
 
 	return NULL;
 }
@@ -180,19 +195,68 @@ int ticcfs_getattr(struct vfsmount *mnt, struct dentry *dentry,
         return simple_getattr(mnt, dentry, stat);
 }
 
-const struct inode_operations ticcfs_file_inode_operations = {
-	.getattr	= ticcfs_getattr,
-	.readlink	= generic_readlink,
-        .follow_link    = ticcfs_follow_link
-};
 
 loff_t ticcfs_llseek(struct file * f, loff_t o, int x)
 {
         return o;
 }
 
+char * ticcfs_data_page(struct inode * inode, loff_t offset, size_t *max_write)
+{
+        DEBUG();
+        int nr_direct, nr_indirect, nr_total_indirect;
+        char *res;
+
+        *max_write = PAGE_SIZE - (offset % PAGE_SIZE);
+        ticcfs_get_direct_indirect(offset + 1, &nr_indirect, &nr_total_indirect, &nr_direct);
+
+        DEBUGM("offset: %ld have direct %d indirect %d", (long)offset, nr_direct, nr_indirect);
+        
+        if(nr_indirect == 0) {
+                res = TICCFS_I(inode)->data_direct[nr_direct - 1];
+                res += offset % PAGE_SIZE;
+        } else {
+                DEBUGM("indirect: %d, %%indirect %ld", nr_indirect, (nr_total_indirect % TICCFS_NDIR_PER_PAGE));
+                res = *(TICCFS_I(inode)->data_indirect[nr_indirect - 1] + ((nr_total_indirect % TICCFS_NDIR_PER_PAGE) - 1));
+                res += offset % PAGE_SIZE;
+                DEBUGS("got pointer");
+        }
+
+        DEBUGM("returning %p", res);
+
+        return res;
+}
+
 ssize_t ticcfs_read(struct file * f, char __user * buff, size_t buff_len, loff_t * ppos)
 {
+        struct dentry *dentry = f->f_dentry;        
+        struct inode *inode = dentry->d_inode;
+        char * d;
+        size_t remains_to_read = buff_len;
+        size_t max_read;
+        size_t read_cnt = 0;
+
+        if(*ppos < inode->i_size) {
+                while(remains_to_read > 0) {
+                        d = ticcfs_data_page(inode, *ppos, &max_read);
+                        if(max_read > remains_to_read)
+                                max_read = remains_to_read;
+                        
+                        DEBUGM("reading %ld, %ld remains", max_read, remains_to_read);
+                        copy_to_user(buff, d, max_read);
+                
+                        *ppos += max_read;
+                        read_cnt += max_read;
+                        remains_to_read -= max_read;
+                }
+                DEBUGM("returing that we read %ld", read_cnt);
+                return read_cnt;
+        } else {
+                return 0;
+        }
+
+
+/*
         struct dentry *dentry = f->f_dentry;
 
         
@@ -207,7 +271,7 @@ ssize_t ticcfs_read(struct file * f, char __user * buff, size_t buff_len, loff_t
                 if(buff_len > inode->i_size - *ppos) {
                         how_much_read = inode->i_size - *ppos;
                 }
-                copy_to_user(buff, ei->data + *ppos, how_much_read);
+                copy_to_user(buff, ei->data_direct[0] + *ppos, how_much_read);
                 *ppos += how_much_read;
 
                 DEBUGM("%d read", how_much_read);
@@ -216,31 +280,36 @@ ssize_t ticcfs_read(struct file * f, char __user * buff, size_t buff_len, loff_t
         }
         else {
                 return 0;
-        }
+                }*/
 }
 
 ssize_t ticcfs_write(struct file * f, const char __user * buff, size_t buff_size, loff_t * offset)
 {
         struct dentry *dentry = f->f_dentry;        
         struct inode *inode = dentry->d_inode;
-        struct ticcfs_inode *ei = TICCFS_I(inode);
+        char * d;
+        size_t remains_to_write = buff_size;
+        size_t max_write;
+        size_t write_cnt = 0;
 
-        DEBUGM("%d", (int)*offset);
+        ticcfs_realloc_data(inode, *offset + buff_size);
+
+        while(remains_to_write > 0) {
+                d = ticcfs_data_page(inode, *offset, &max_write);
+                if(max_write > remains_to_write)
+                        max_write = remains_to_write;
+
+                copy_from_user(d, buff, max_write);
+                
+                inode->i_size = *offset + max_write;
+                *offset += max_write;
+                write_cnt += max_write;
+                remains_to_write -= max_write;
+        }
         
-        if(*offset < TICCFS_DATALEN) {
-                int how_much_write = TICCFS_DATALEN - *offset;
-                if(buff_size < how_much_write)
-                        how_much_write = buff_size;
+        DEBUGM("written %ld", write_cnt);
 
-                copy_from_user(ei->data + *offset, buff, how_much_write);
-                inode->i_size = *offset + how_much_write;
-                *offset += how_much_write;
-                DEBUGM("%d written", how_much_write);
-                return how_much_write;
-        }
-        else {
-                return buff_size;
-        }
+        return write_cnt;
 }
 
 int ticcfs_release(struct inode * inode, struct file * f)
@@ -248,32 +317,19 @@ int ticcfs_release(struct inode * inode, struct file * f)
         return 0;
 }
 
-const struct file_operations ticcfs_file_operations = {
-        .llseek         = ticcfs_llseek,
-        .read           = ticcfs_read,
-        .write          = ticcfs_write,
-        .release        = ticcfs_release,
-};
-
-static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_t dev, struct ticcfs_inode* xxx) 
+static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_t dev) 
 {
         struct inode* inode;
         struct ticcfs_dir *d;
 
         DEBUG();
 
-        if(xxx)
-                DEBUGM("1 %p", xxx->data);
         inode = new_inode(sb);
         DEBUGM("sb %p imapping-aops: %p", TICCFS_I(inode)->vfs_inode.i_sb, inode->i_mapping->a_ops);
-        if(xxx)
-                DEBUGM("11 %p", xxx->data);
     
         if(!inode)
                 return NULL;
 
-        mapping_set_unevictable(inode->i_mapping);
-        mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
         inode->i_mode = mode;
         inode->i_uid = 0;
         inode->i_gid = 0;
@@ -292,7 +348,9 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
                 break;
         case S_IFDIR:             
                 printk("ticcfs: dir\n");
-                d = TICCFS_I(inode)->data;
+                TICCFS_I(inode)->data_direct[0] = (void *) get_zeroed_page(GFP_KERNEL); // alloc_page(GFP_KERNEL);
+
+                d = (struct ticcfs_dir *) TICCFS_I(inode)->data_direct[0];
                 d->cnt = 0;
 
                 inode->i_fop = &ticcfs_dir_operations;
@@ -302,11 +360,10 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
                 DEBUGM("%s", "after nlink");
                 break;
         case S_IFLNK:
+                TICCFS_I(inode)->data_direct[0] = (void *) get_zeroed_page(GFP_KERNEL); // alloc_page(GFP_KERNEL);
                 inode->i_op = &ticcfs_file_inode_operations;
                 break;
         }
-        if(xxx)
-                DEBUGM("2 %p", xxx->data);
 
         return inode;
 }
@@ -317,13 +374,11 @@ static int ticcfs_mknod(struct inode *dir, struct dentry *dentry, int mode, dev_
         struct inode * inode;
 
         DEBUG();
-        DEBUGM("0 %p", TICCFS_I(dir)->data);
-        inode = ticcfs_get_inode(dir->i_sb, mode, dev, TICCFS_I(dir));
-        DEBUGM("0* %p", TICCFS_I(dir)->data);
+        inode = ticcfs_get_inode(dir->i_sb, mode, dev);
         if(inode) 
         {
                 DEBUGM("%s %p %p %lu", dentry->d_name.name, inode->i_op, &ticcfs_file_inode_operations, inode->i_ino);
-                d = TICCFS_I(dir)->data;
+                d = (struct ticcfs_dir *) TICCFS_I(dir)->data_direct[0];
                 DEBUGM("# of entries %d", d->cnt);
                 d->entries[d->cnt].i = inode;
                 strncpy(d->entries[d->cnt].name, dentry->d_name.name, dentry->d_name.len);
@@ -366,7 +421,7 @@ static int ticcfs_symlink(struct inode *dir, struct dentry *dentry, const char *
 
         DEBUG();
 
-        inode = ticcfs_get_inode(dir->i_sb, S_IFLNK | S_IRWXUGO, 0, NULL);
+        inode = ticcfs_get_inode(dir->i_sb, S_IFLNK | S_IRWXUGO, 0);
         if(inode) 
         {
                 d_instantiate(dentry, inode);
@@ -374,7 +429,7 @@ static int ticcfs_symlink(struct inode *dir, struct dentry *dentry, const char *
                 dir->i_mtime = dir->i_ctime = CURRENT_TIME;
 
                 printk("ticcfs: new symlink %s\n", symname);
-                strcpy(TICCFS_I(inode)->data, symname);
+                strcpy(TICCFS_I(inode)->data_direct[0], symname);
                 inode->i_size = strlen(symname) + 1;
 
                 return 0;
@@ -390,14 +445,6 @@ struct dentry *ticcfs_lookup(struct inode *dir, struct dentry *dentry, struct na
         return simple_lookup(dentry->d_inode, dentry, nd);
 }
 
-
-const struct inode_operations ticcfs_dir_inode_operations = {
-	.lookup		= ticcfs_lookup,
-	.mknod		= ticcfs_mknod,
-        .mkdir          = ticcfs_mkdir,
-        .symlink        = ticcfs_symlink,
-        .create         = ticcfs_create,
-};
 
 int ticcfs_fill_super(struct super_block* sb, void* data, int silent) 
 {
@@ -417,7 +464,7 @@ int ticcfs_fill_super(struct super_block* sb, void* data, int silent)
         
         ticcfs_parse_options(data, &fsi->mount_opts);
         
-        inode = ticcfs_get_inode(sb, S_IFDIR | 0755, 0, NULL);
+        inode = ticcfs_get_inode(sb, S_IFDIR | 0755, 0);
         if(!inode) return -ENOMEM;
 
         DEBUGM("d_alloc_root %lu", inode->i_ino);
@@ -494,7 +541,6 @@ static void ticcfs_destroy_inodecache(void)
 }
 
 
-
 void ticcfs_kill_sb(struct super_block* sb) 
 {
         DEBUG();
@@ -519,8 +565,8 @@ static int __init ticcfs_init(void) {
 }
 
 static void __exit ticcfs_exit(void) {
-        ticcfs_destroy_inodecache();
         unregister_filesystem(&fs_type);
+        ticcfs_destroy_inodecache();
 }
 
 module_init(ticcfs_init);
