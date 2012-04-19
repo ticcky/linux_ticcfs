@@ -1,0 +1,42 @@
+#!/bin/bash
+
+insmod /mnt/home/ticcfs.ko
+
+mkdir -p /mnt/test
+mkdir -p /mnt/testB
+dd if=/dev/urandom of=test_8k bs=1 count=8192
+dd if=/dev/urandom of=data bs=1 count=12345
+dd if=/dev/urandom of=data_big bs=1 count=99999
+
+for i in $(seq 20); do
+	mount -t ticcfs none /mnt/test -o A
+	mount -t ticcfs none /mnt/testB -o B 
+
+	echo "test" > /mnt/test/a
+	cat test_8k > /mnt/test/b
+	cat test_8k test_8k test_8k test_8k > test_8k_ref
+	cat test_8k test_8k test_8k test_8k > /mnt/test/c
+	mkdir -p /mnt/test/mydir/ttt/asdf
+        cp data /mnt/test/mydir/xxxx
+        cp data_big /mnt/test/mydir/xxxx_big
+	cat test_8k test_8k test_8k test_8k > /mnt/test/mydir/ttt/asdf/x
+
+	ln -s /mnt/test/mydir/ttt/asdf/x /mnt/test/from_mydir
+	diff /mnt/test/mydir/ttt/asdf/x /mnt/test/from_mydir
+	diff /mnt/test/from_mydir test_8k_ref 
+
+
+	diff /mnt/test/b test_8k
+	diff /mnt/test/c test_8k_ref
+	diff /mnt/test/mydir/ttt/asdf/x test_8k_ref
+        diff /mnt/test/mydir/xxxx data
+        diff /mnt/test/mydir/xxxx_big data_big
+
+	ls -la /mnt/test > /dev/null
+	ls -la /mnt/testB > /dev/null
+
+	umount /mnt/test
+	umount /mnt/testB
+done
+
+rmmod /mnt/home/ticcfs.ko
