@@ -4,9 +4,9 @@ TODO:
    options, sb->s_fs_info (private SB data), sb->s_options,
    (generic_)show_options(), mount -t posfs none /kam -o A)
  * přidejte podporu pro podadresáře
- - umožněte neomezený počet objektů v souborovém systému (čím je reálně omezeno?) - 2^(sizeof(unsigned long))
- - data souboru ukládejte do samostatné stránky, v i-node bude jen odkaz na stránku (max. datasize 4KB)
- - rozšiřte ukládání souborů na systém s N přímými dat. bloky, M nepřímými
+ * umožněte neomezený počet objektů v souborovém systému (čím je reálně omezeno?) - 2^(sizeof(unsigned long))
+ * data souboru ukládejte do samostatné stránky, v i-node bude jen odkaz na stránku (max. datasize 4KB)
+ * rozšiřte ukládání souborů na systém s N přímými dat. bloky, M nepřímými
 
 
 predelat statfs
@@ -20,6 +20,7 @@ predelat statfs
 #include <linux/statfs.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
+#include <linux/mount.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lukas Zilka <lukas@zilka.me>");
@@ -118,6 +119,42 @@ static int ticcfs_parse_options(char *data, struct ticcfs_mount_opts *opts)
         return 0;
 }
 
+void ticcfs_free_page(void *p) {
+        if(p != NULL) {
+                DEBUGM("freeing %p", p);
+                free_page((long) p);
+        }
+                
+}
+
+void ticcfs_free_pages(struct inode *inode) 
+{
+        int i, y;
+        for(i = 0; i < TICCFS_NDIR; i++) {
+                DEBUGM("freeing direct %d %p", i, TICCFS_I(inode)->data_direct[i]);
+                ticcfs_free_page(TICCFS_I(inode)->data_direct[i]);
+        }
+
+        for(i = 0; i < TICCFS_NINDIR; i++) {
+                if(TICCFS_I(inode)->data_indirect[i] != NULL) {
+                        for(y = 0; y < TICCFS_NDIR_PER_PAGE; y++) {
+                                DEBUGM("freeing INdirect %d,%d %p,%p", i, y, TICCFS_I(inode)->data_indirect[i], TICCFS_I(inode)->data_indirect[i][y]);
+
+                                ticcfs_free_page(TICCFS_I(inode)->data_indirect[i][y]);
+                        }
+                }
+                DEBUGM("freeing INdirect directory %p", TICCFS_I(inode)->data_indirect[i]);
+                ticcfs_free_page((void *)TICCFS_I(inode)->data_indirect[i]);
+        }
+        DEBUGS("free done");
+}
+
+static void ticcfs_destroy_inode(struct inode *inode)
+{
+        ticcfs_free_pages(inode);
+        kmem_cache_free(ticcfs_inode_cachep, TICCFS_I(inode));
+}
+
 static struct inode *ticcfs_alloc_inode(struct super_block *sb)
 {
         struct ticcfs_inode *ti;
@@ -191,7 +228,7 @@ static void *ticcfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 int ticcfs_getattr(struct vfsmount *mnt, struct dentry *dentry,
 		   struct kstat *stat)
 {
-        printk("ticcfs: getattr\n");
+        DEBUGS("getattr");
         return simple_getattr(mnt, dentry, stat);
 }
 
@@ -202,10 +239,11 @@ loff_t ticcfs_llseek(struct file * f, loff_t o, int x)
 }
 
 char * ticcfs_data_page(struct inode * inode, loff_t offset, size_t *max_write)
-{
-        DEBUG();
+{        
         int nr_direct, nr_indirect, nr_total_indirect;
         char *res;
+
+        DEBUG();
 
         *max_write = PAGE_SIZE - (offset % PAGE_SIZE);
         ticcfs_get_direct_indirect(offset + 1, &nr_indirect, &nr_total_indirect, &nr_direct);
@@ -235,8 +273,12 @@ ssize_t ticcfs_read(struct file * f, char __user * buff, size_t buff_len, loff_t
         size_t remains_to_read = buff_len;
         size_t max_read;
         size_t read_cnt = 0;
+        DEBUGM("this file's size is %ld", inode->i_size);
 
         if(*ppos < inode->i_size) {
+                if(*ppos + remains_to_read > inode->i_size)
+                        remains_to_read = inode->i_size - *ppos;
+
                 while(remains_to_read > 0) {
                         d = ticcfs_data_page(inode, *ppos, &max_read);
                         if(max_read > remains_to_read)
@@ -248,39 +290,13 @@ ssize_t ticcfs_read(struct file * f, char __user * buff, size_t buff_len, loff_t
                         *ppos += max_read;
                         read_cnt += max_read;
                         remains_to_read -= max_read;
+                        buff += max_read;
                 }
                 DEBUGM("returing that we read %ld", read_cnt);
                 return read_cnt;
         } else {
                 return 0;
         }
-
-
-/*
-        struct dentry *dentry = f->f_dentry;
-
-        
-        struct inode *inode = dentry->d_inode;
-        struct ticcfs_inode *ei = TICCFS_I(inode);
-
-        DEBUGM("read %d", (int)*ppos);        
-        
-        DEBUGM("size of this file is %d", (int) inode->i_size);
-        if(*ppos <= inode->i_size) {
-                int how_much_read = buff_len;
-                if(buff_len > inode->i_size - *ppos) {
-                        how_much_read = inode->i_size - *ppos;
-                }
-                copy_to_user(buff, ei->data_direct[0] + *ppos, how_much_read);
-                *ppos += how_much_read;
-
-                DEBUGM("%d read", how_much_read);
-
-                return how_much_read;
-        }
-        else {
-                return 0;
-                }*/
 }
 
 ssize_t ticcfs_write(struct file * f, const char __user * buff, size_t buff_size, loff_t * offset)
@@ -305,6 +321,7 @@ ssize_t ticcfs_write(struct file * f, const char __user * buff, size_t buff_size
                 *offset += max_write;
                 write_cnt += max_write;
                 remains_to_write -= max_write;
+                buff += write_cnt;
         }
         
         DEBUGM("written %ld", write_cnt);
@@ -317,6 +334,19 @@ int ticcfs_release(struct inode * inode, struct file * f)
         return 0;
 }
 
+void ticcfs_init_inode(struct inode *inode) 
+{
+        int i;
+        for(i = 0; i < TICCFS_NDIR; i++) {
+                TICCFS_I(inode)->data_direct[i] = NULL;
+        }
+
+        for(i = 0; i < TICCFS_NINDIR; i++) {
+                TICCFS_I(inode)->data_indirect[i] = NULL;
+        }
+
+}
+
 static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_t dev) 
 {
         struct inode* inode;
@@ -325,6 +355,7 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
         DEBUG();
 
         inode = new_inode(sb);
+        ticcfs_init_inode(inode);
         DEBUGM("sb %p imapping-aops: %p", TICCFS_I(inode)->vfs_inode.i_sb, inode->i_mapping->a_ops);
     
         if(!inode)
@@ -336,19 +367,20 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
         inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
         mark_inode_dirty(inode);
 
-
+        
         switch (mode & S_IFMT)
         {
         default:
                 init_special_inode(inode, mode, dev);
                 break;
         case S_IFREG:
-                printk("ticcfs: file\n");
+                DEBUGS("file");
                 inode->i_fop = &ticcfs_file_operations;
                 break;
         case S_IFDIR:             
-                printk("ticcfs: dir\n");
+                DEBUGS("dir");
                 TICCFS_I(inode)->data_direct[0] = (void *) get_zeroed_page(GFP_KERNEL); // alloc_page(GFP_KERNEL);
+                DEBUGM("allocating %p", TICCFS_I(inode)->data_direct[0]);
 
                 d = (struct ticcfs_dir *) TICCFS_I(inode)->data_direct[0];
                 d->cnt = 0;
@@ -360,7 +392,9 @@ static struct inode* ticcfs_get_inode(struct super_block* sb, umode_t mode, dev_
                 DEBUGM("%s", "after nlink");
                 break;
         case S_IFLNK:
+                DEBUGS("link");
                 TICCFS_I(inode)->data_direct[0] = (void *) get_zeroed_page(GFP_KERNEL); // alloc_page(GFP_KERNEL);
+                DEBUGM("allocating %p", TICCFS_I(inode)->data_direct[0]);
                 inode->i_op = &ticcfs_file_inode_operations;
                 break;
         }
@@ -428,7 +462,7 @@ static int ticcfs_symlink(struct inode *dir, struct dentry *dentry, const char *
                 dget(dentry);
                 dir->i_mtime = dir->i_ctime = CURRENT_TIME;
 
-                printk("ticcfs: new symlink %s\n", symname);
+                DEBUGM("new symlink %s\n", symname);
                 strcpy(TICCFS_I(inode)->data_direct[0], symname);
                 inode->i_size = strlen(symname) + 1;
 
@@ -445,12 +479,23 @@ struct dentry *ticcfs_lookup(struct inode *dir, struct dentry *dentry, struct na
         return simple_lookup(dentry->d_inode, dentry, nd);
 }
 
+char ticcfs_get_id(char *data) 
+{
+        DEBUG();
+
+        if(data == NULL || strlen(data) == 0)
+                return TICCFS_DEFAULT_ID;
+        else {
+                return data[0];
+        }
+}
 
 int ticcfs_fill_super(struct super_block* sb, void* data, int silent) 
 {
         struct dentry* root;
         struct inode* inode;
         struct ticcfs_fs_info *fsi;
+        char my_id;
 
         DEBUG();
 
@@ -464,6 +509,9 @@ int ticcfs_fill_super(struct super_block* sb, void* data, int silent)
         
         ticcfs_parse_options(data, &fsi->mount_opts);
         
+        my_id = ticcfs_get_id(data);
+
+        DEBUGS("allocating new inode");
         inode = ticcfs_get_inode(sb, S_IFDIR | 0755, 0);
         if(!inode) return -ENOMEM;
 
@@ -471,21 +519,12 @@ int ticcfs_fill_super(struct super_block* sb, void* data, int silent)
         root = d_alloc_root(inode);
         DEBUGS("after alloc root");
         if(!root) return -ENOMEM;
+        DEBUGM("using root at %p", root);
 
         sb->s_root = root;
         DEBUGS("end fill super");
+
         return 0;
-}
-
-char ticcfs_get_id(char *data) 
-{
-        DEBUG();
-
-        if(data == NULL || strlen(data) == 0)
-                return TICCFS_DEFAULT_ID;
-        else {
-                return data[0];
-        }
 }
 
 int ticcfs_get_sb(struct file_system_type* fstype, int flags, const char* dev_name, 
@@ -503,9 +542,8 @@ int ticcfs_get_sb(struct file_system_type* fstype, int flags, const char* dev_na
         list_for_each_entry(s, &(fstype->fs_supers), s_instances) {        
                 fsi = (struct ticcfs_fs_info *)s->s_fs_info;
                 if(fsi->mount_opts.id == id) {
-                        printk("ticcfs: reusing\n");
-                        simple_set_mnt(mnt, s);
-                        return 0;
+                        DEBUGS("already mounted");
+                        return -EPERM;
                 }
         }
         
@@ -561,6 +599,8 @@ static struct file_system_type fs_type =
 static int __init ticcfs_init(void) {
         ticcfs_init_inodecache();
         register_filesystem(&fs_type);
+        //for(i = 0; i < TICCFS_MNT_POINTS; i++)
+                
         return 0; 
 }
 

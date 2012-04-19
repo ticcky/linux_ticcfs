@@ -1,6 +1,5 @@
 #include <linux/fs.h>
 
-
 #define TICCFS_MAGIC 0x99999
 #define TICCFS_COUNT 32  // max number of files
 #define TICCFS_NAMELEN 64 // max filename size
@@ -9,12 +8,21 @@
 #define TICCFS_NINDIR 5
 #define TICCFS_NDIR_PER_PAGE (PAGE_SIZE/sizeof(void *))
 #define TICCFS_MAX_DATALEN (TICCFS_NDIR * PAGE_SIZE + TICCFS_NINDIR * TICCFS_NDIR_PER_PAGE * PAGE_SIZE) // max filesize
+#define TICCFS_MNT_POINTS (1 << (sizeof(char) * 8))
 
+//#define DEBUG_MSGS
+#ifdef DEBUG_MSGS
 #define DEBUG(args...) {printk("ticcfs [%s] ------ \n", __FUNCTION__);}
 #define DEBUGM(format, args...) {printk("ticcfs [%s]: ", __FUNCTION__); printk(format "\n", args);}
 #define DEBUGS(s) {printk("ticcfs [%s]: %s\n", __FUNCTION__, s);}
+#else
+#define DEBUG(args...)
+#define DEBUGM(format, args...)
+#define DEBUGS(s)
+#endif
 
 static struct inode *ticcfs_alloc_inode(struct super_block *sb);
+static void ticcfs_destroy_inode(struct inode *inode);
 static int ticcfs_readdir(struct file * filp, void *dirent, filldir_t filldir);
 struct dentry *ticcfs_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *nd);
 static int ticcfs_mknod(struct inode *dir, struct dentry *dentry, int mode, dev_t dev);
@@ -56,9 +64,10 @@ struct ticcfs_dir {
 
 static struct super_operations ticcfs_sops = {
         .statfs = simple_statfs,
-	.drop_inode	= generic_delete_inode,
+	//.drop_inode	= generic_delete_inode,
 	.show_options	= generic_show_options,
         .alloc_inode    = ticcfs_alloc_inode,
+        .destroy_inode  = ticcfs_destroy_inode
 };
 
 const struct file_operations ticcfs_dir_operations = {
